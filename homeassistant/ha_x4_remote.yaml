@@ -1,0 +1,100 @@
+# Home Assistant: Template-Sensor für die X4-Fernbedienung
+# Ablage im HA-Konfigurationsordner, Einbinden in configuration.yaml mit:
+#   template: !include ha_x4_remote.yaml
+#
+# Labels (Settings → Areas, labels & zones → Labels):
+#   x4_ausblenden  – Entität nicht auf dem X4 zeigen
+#   x4             – nur diese Media-Player zeigen (ohne Label: alle)
+#   x4_pv_modul    – Leistung eines einzelnen PV-Moduls / Solar-Eingangs (W oder kW)
+#   x4_pv_gesamt   – aktuelle PV-Gesamtleistung (optional, sonst Summe der Module)
+#   x4_pv_heute    – PV-Ertrag heute (kWh oder Wh)
+#   x4_pv_akku     – Akkustand in % (optional)
+- sensor:
+    - name: "X4 Remote"
+      unique_id: x4_remote_data
+      icon: mdi:remote
+      state: "{{ areas() | count }}"
+      attributes:
+        rooms: >-
+          {%- set hide = label_entities('x4_ausblenden') -%}
+          {%- set skip = '(child_lock|kindersicherung|_led|led_|indicator|backlight|power_on|identify|restart|reboot|firmware|_mode$)' -%}
+          {%- set ns = namespace(rooms=[]) -%}
+          {%- for a in areas() -%}
+            {%- set an = area_name(a) -%}
+            {%- set r = namespace(t=none, h=none, items=[], w=[]) -%}
+            {%- for e in area_entities(a) | sort -%}
+              {%- set d = e.split('.')[0] -%}
+              {%- set dc = state_attr(e, 'device_class') -%}
+              {%- if e in hide -%}
+              {%- elif d == 'sensor' and r.t is none and dc == 'temperature' and is_number(states(e)) -%}
+                {%- set r.t = states(e) | float | round(1) -%}
+              {%- elif d == 'sensor' and r.h is none and dc == 'humidity' and is_number(states(e)) -%}
+                {%- set r.h = states(e) | float | round(0) | int -%}
+              {%- elif d == 'binary_sensor' and dc in ['window', 'door', 'opening', 'garage_door'] and states(e) in ['on', 'off'] -%}
+                {%- set n = (state_attr(e, 'friendly_name') or e) | replace(an ~ ' ', '') | trim -%}
+                {%- set r.w = r.w + [{'n': n[:24], 'o': 1 if is_state(e, 'on') else 0}] -%}
+              {%- elif d in ['light', 'switch'] and states(e) in ['on', 'off'] and (d == 'light' or not (e is search(skip, ignorecase=true))) -%}
+                {%- set n = (state_attr(e, 'friendly_name') or e) | replace(an ~ ' ', '') | trim -%}
+                {#- Steckdosen: Leistungssensor desselben Geräts suchen -#}
+                {%- set q = namespace(p=none) -%}
+                {%- if d == 'switch' and device_id(e) -%}
+                  {%- for pe in device_entities(device_id(e)) -%}
+                    {%- if q.p is none and pe.startswith('sensor.') and state_attr(pe, 'device_class') == 'power' and is_number(states(pe)) -%}
+                      {%- set q.p = ((states(pe) | float) * (1000 if state_attr(pe, 'unit_of_measurement') == 'kW' else 1)) | round(0) | int -%}
+                    {%- endif -%}
+                  {%- endfor -%}
+                {%- endif -%}
+                {%- set r.items = r.items + [{'e': e, 'n': n[:28], 't': 'l' if d == 'light' else 's', 's': 1 if is_state(e, 'on') else 0, 'p': q.p}] -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {%- if r.items | count > 0 or r.w | count > 0 or r.t is not none or r.h is not none -%}
+              {%- set ns.rooms = ns.rooms + [{'n': an, 't': r.t, 'h': r.h, 'w': r.w, 'i': r.items}] -%}
+            {%- endif -%}
+          {%- endfor -%}
+          J{{ ns.rooms | to_json }}
+        media: >-
+          {%- set lab = label_entities('x4') | select('match', 'media_player[.]') | list -%}
+          {%- set mps = lab if lab | count > 0 else states.media_player | rejectattr('state', 'in', ['unavailable', 'unknown']) | map(attribute='entity_id') | list -%}
+          {%- set ns = namespace(p=[]) -%}
+          {%- for e in mps[:6] -%}
+            {%- set v = state_attr(e, 'volume_level') -%}
+            {%- set ns.p = ns.p + [{
+                  'e': e,
+                  'n': (state_attr(e, 'friendly_name') or e)[:28],
+                  's': states(e),
+                  'ti': (state_attr(e, 'media_title') or '') | string | truncate(80, true, ''),
+                  'ar': (state_attr(e, 'media_artist') or '') | string | truncate(60, true, ''),
+                  'al': (state_attr(e, 'media_album_name') or state_attr(e, 'app_name') or '') | string | truncate(60, true, ''),
+                  'v': ((v * 100) | round(0) | int) if v is number else -1
+                }] -%}
+          {%- endfor -%}
+          J{{ ns.p | to_json }}
+        pv: >-
+          {#- Umrechnung Tagesertrag: Sensor liefert Wh → 0.001 ergibt kWh.
+              Liefert dein Sensor schon echte kWh, hier 1 eintragen. -#}
+          {%- set faktor_heute = 0.001 -%}
+          {%- set ns = namespace(m=[], p=none, d=none, b=none) -%}
+          {%- for e in label_entities('x4_pv_modul') | sort -%}
+            {%- if is_number(states(e)) -%}
+              {%- set f = 1000 if state_attr(e, 'unit_of_measurement') == 'kW' else 1 -%}
+              {%- set n = state_attr(e, 'friendly_name') or e -%}
+              {%- set n = n if n | length <= 20 else 'Modul ' ~ loop.index -%}
+              {%- set ns.m = ns.m + [{'n': n, 'p': ((states(e) | float) * f) | round(0) | int}] -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {%- set t = label_entities('x4_pv_gesamt') | first | default(none) -%}
+          {%- if t and is_number(states(t)) -%}
+            {%- set f = 1000 if state_attr(t, 'unit_of_measurement') == 'kW' else 1 -%}
+            {%- set ns.p = ((states(t) | float) * f) | round(0) | int -%}
+          {%- elif ns.m | count > 0 -%}
+            {%- set ns.p = ns.m | sum(attribute='p') -%}
+          {%- endif -%}
+          {%- set dd = label_entities('x4_pv_heute') | first | default(none) -%}
+          {%- if dd and is_number(states(dd)) -%}
+            {%- set ns.d = ((states(dd) | float) * faktor_heute) | round(2) -%}
+          {%- endif -%}
+          {%- set bb = label_entities('x4_pv_akku') | first | default(none) -%}
+          {%- if bb and is_number(states(bb)) -%}
+            {%- set ns.b = states(bb) | float | round(0) | int -%}
+          {%- endif -%}
+          J{{ {'p': ns.p, 'd': ns.d, 'b': ns.b, 'm': ns.m} | to_json }}

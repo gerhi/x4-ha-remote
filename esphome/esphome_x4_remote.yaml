@@ -1,0 +1,990 @@
+# ESPHome-Konfiguration: Xteink X4 als Home-Assistant-Fernbedienung
+# =====================================================================
+#  X4 Remote – ESPHome-Konfiguration für den Xteink X4 (ESP32-C3)
+#
+#  Drei Ebenen, mit Back durchschalten:  Räume → Medien → Energie → Räume
+#  Daten kommen aus sensor.x4_remote (ha_x4_remote.yaml in Home Assistant).
+#
+#  Tasten (Front von links nach rechts: Back · OK · Links · Rechts;
+#  rechte Seite: Power, darunter Hoch/+ und Runter/−):
+#
+#    Räume – Übersicht:  zeigt alle Räume mit Fenstern/Türen und ob sie offen sind;
+#                        Hoch/Runter = Raum wählen, OK = Raum öffnen, Links/Rechts = blättern
+#    Räume – ein Raum:   Links/Rechts = Raum wechseln, Hoch/Runter = Gerät wählen,
+#                        OK = schalten (lang: alles im Raum aus)
+#    Medien:             OK = Play/Pause, Links/Rechts = Titel zurück/weiter,
+#                        lang Links/Rechts = Player wechseln, Hoch/Runter = Lautstärke
+#    Energie:            OK = neu zeichnen
+#    Power:              kurz = neu zeichnen, lang (1 s) = schlafen
+#
+#  Schlaf: Aufwachen nur per Power-Taste, automatisch aus nach 5 min ohne
+#  Tastendruck. Schalter "Wach bleiben (für Updates)" in HA verhindert das.
+#
+#  In HA: Settings → Devices & services → ESPHome → X4 Remote → Configure →
+#  "Allow the device to perform Home Assistant actions" einschalten.
+# =====================================================================
+
+substitutions:
+  device_name: x4-remote
+  friendly_name: X4 Remote
+  data_sensor: sensor.x4_remote
+  idle_timeout: 5min
+  # Lage der Seitentasten in Pixeln von oben (Display ist 800 Pixel hoch,
+  # ca. 8,6 Pixel pro Millimeter). Mitte der Taste = Wert + 32.
+  power_y: "135"
+  up_y: "345"
+  down_y: "430"
+  # Spitzenleistung eines PV-Moduls in Watt (für die Balkenlänge)
+  pv_module_peak: "450"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    - priority: -100
+      then:
+        - script.execute: idle_timer
+        - wait_until:
+            condition:
+              api.connected:
+            timeout: 15s
+        - delay: 1500ms
+        - component.update: epd
+
+esp32:
+  board: esp32-c3-devkitm-1
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret x4_api_key
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  fast_connect: true
+  power_save_mode: light
+
+safe_mode:
+  boot_is_good_after: 10s
+
+time:
+  - platform: homeassistant
+    id: ha_time
+
+json:
+
+# ---------------------------------------------------------------------
+#  Display: 4,26" SSD1677, 800x480, hochkant gedreht
+# ---------------------------------------------------------------------
+spi:
+  clk_pin: GPIO8
+  mosi_pin: GPIO10
+
+font:
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: 400
+    id: f_s
+    size: 22
+    glyphs: &glyphs ' !"#$%&''()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~°·ÀÁÄÇÈÉÍÑÓÖÚÜßàáâäåæçèéêìíñòóôöøùúûüœ–—…−'
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: 500
+    id: f_m
+    size: 30
+    glyphs: *glyphs
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: 500
+    id: f_l
+    size: 40
+    glyphs: *glyphs
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: 500
+    id: f_xl
+    size: 76
+    glyphs: ' %,-.0123456789Wk°–'
+
+display:
+  - platform: epaper_spi
+    id: epd
+    model: SSD1677
+    cs_pin: GPIO21
+    dc_pin: GPIO4
+    reset_pin: GPIO5
+    busy_pin:
+      number: GPIO6
+      inverted: false
+    dimensions:
+      width: 800
+      height: 480
+    # Hochkant. Steht das Bild auf dem Kopf: 270 statt 90.
+    rotation: 90
+    # Ist das Bild gespiegelt: mirror_x auf false bzw. true umstellen.
+    transform:
+      mirror_x: true
+      mirror_y: false
+    full_update_every: 15
+    update_interval: never
+    lambda: |-
+      // Farben. Erscheint alles invertiert, die beiden Werte tauschen.
+      const Color INK = Color::BLACK;
+      const Color PAPER = Color::WHITE;
+
+      const int W = it.get_width();     // 480
+      const int H = it.get_height();    // 800
+      const int TAB_W = 34;
+      const int PWR_Y = ${power_y}, PWR_H = 64;
+      const int UP_Y = ${up_y}, DN_Y = ${down_y}, SIDE_H = 64;
+      const int PV_PEAK = ${pv_module_peak};
+      const int CW = W - TAB_W - 16;    // Inhaltsbreite links der Tabs
+      const int BAR_H = 92;
+      const int BAR_Y = H - BAR_H;
+      const int STAT_Y = BAR_Y - 22;    // Statuszeile über der unteren Leiste
+
+      it.fill(PAPER);
+
+      // ---------- Hilfsfunktionen ----------
+      auto textw = [&](const std::string &s, display::BaseFont *f) -> int {
+        int x1, y1, w, h;
+        it.get_text_bounds(0, 0, s.c_str(), f, TextAlign::TOP_LEFT, &x1, &y1, &w, &h);
+        return w;
+      };
+      auto pop_char = [](std::string &s) {
+        while (!s.empty() && (s.back() & 0xC0) == 0x80) s.pop_back();
+        if (!s.empty()) s.pop_back();
+      };
+      auto fit = [&](std::string s, display::BaseFont *f, int maxw) -> std::string {
+        if (textw(s, f) <= maxw) return s;
+        while (!s.empty() && textw(s + "…", f) > maxw) pop_char(s);
+        return s + "…";
+      };
+      auto wrap2 = [&](const std::string &s, display::BaseFont *f, int maxw, std::string &l1, std::string &l2) {
+        l2 = "";
+        if (textw(s, f) <= maxw) { l1 = s; return; }
+        size_t best = 0;
+        for (size_t i = 1; i < s.size(); i++)
+          if (s[i] == ' ' && textw(s.substr(0, i), f) <= maxw) best = i;
+        if (best == 0) { l1 = fit(s, f, maxw); return; }
+        l1 = s.substr(0, best);
+        l2 = fit(s.substr(best + 1), f, maxw);
+      };
+
+      // ---------- Icons ----------
+      auto ico_play  = [&](int cx, int cy, Color c) { it.filled_triangle(cx - 9, cy - 12, cx - 9, cy + 12, cx + 12, cy, c); };
+      auto ico_pause = [&](int cx, int cy, Color c) { it.filled_rectangle(cx - 10, cy - 12, 7, 24, c); it.filled_rectangle(cx + 3, cy - 12, 7, 24, c); };
+      auto ico_next  = [&](int cx, int cy, Color c) { it.filled_triangle(cx - 12, cy - 11, cx - 12, cy + 11, cx + 6, cy, c); it.filled_rectangle(cx + 7, cy - 11, 5, 22, c); };
+      auto ico_prev  = [&](int cx, int cy, Color c) { it.filled_triangle(cx + 12, cy - 11, cx + 12, cy + 11, cx - 6, cy, c); it.filled_rectangle(cx - 12, cy - 11, 5, 22, c); };
+      auto ico_left  = [&](int cx, int cy, Color c) { it.filled_triangle(cx + 8, cy - 12, cx + 8, cy + 12, cx - 10, cy, c); };
+      auto ico_right = [&](int cx, int cy, Color c) { it.filled_triangle(cx - 8, cy - 12, cx - 8, cy + 12, cx + 10, cy, c); };
+      auto ico_up    = [&](int cx, int cy, Color c) { it.filled_triangle(cx - 10, cy + 7, cx + 10, cy + 7, cx, cy - 9, c); };
+      auto ico_down  = [&](int cx, int cy, Color c) { it.filled_triangle(cx - 10, cy - 7, cx + 10, cy - 7, cx, cy + 9, c); };
+      auto ico_home  = [&](int cx, int cy, Color c) { it.filled_triangle(cx - 14, cy - 1, cx + 14, cy - 1, cx, cy - 14, c); it.filled_rectangle(cx - 9, cy - 1, 18, 14, c); };
+      auto ico_note  = [&](int cx, int cy, Color c) { it.filled_circle(cx - 5, cy + 8, 6, c); it.filled_rectangle(cx, cy - 13, 3, 21, c); it.filled_rectangle(cx, cy - 13, 11, 4, c); };
+      auto ico_sun   = [&](int cx, int cy, Color c) {
+        it.filled_circle(cx, cy, 7, c);
+        it.line(cx, cy - 14, cx, cy - 10, c); it.line(cx, cy + 10, cx, cy + 14, c);
+        it.line(cx - 14, cy, cx - 10, cy, c); it.line(cx + 10, cy, cx + 14, cy, c);
+        it.line(cx - 10, cy - 10, cx - 7, cy - 7, c); it.line(cx + 7, cy + 7, cx + 10, cy + 10, c);
+        it.line(cx + 10, cy - 10, cx + 7, cy - 7, c); it.line(cx - 7, cy + 7, cx - 10, cy + 10, c);
+      };
+      auto ico_refresh = [&](int cx, int cy, Color fg, Color bg) {
+        it.filled_circle(cx, cy, 12, fg); it.filled_circle(cx, cy, 9, bg);
+        it.filled_rectangle(cx + 2, cy - 13, 12, 10, bg);
+        it.filled_triangle(cx + 1, cy - 16, cx + 1, cy - 4, cx + 10, cy - 10, fg);
+      };
+      auto ico_power = [&](int cx, int cy, Color fg, Color bg) {
+        it.filled_circle(cx, cy + 2, 13, fg); it.filled_circle(cx, cy + 2, 10, bg);
+        it.filled_rectangle(cx - 5, cy - 14, 10, 12, bg); it.filled_rectangle(cx - 1, cy - 14, 3, 14, fg);
+      };
+      // Fenster-Symbol: gefüllt = offen, Umriss = zu
+      auto ico_window = [&](int x, int y, bool open, Color fg, Color bg) {
+        if (open) {
+          it.filled_rectangle(x, y, 20, 24, fg);
+          it.filled_rectangle(x + 9, y + 3, 2, 18, bg);
+          it.filled_rectangle(x + 3, y + 11, 14, 2, bg);
+        } else {
+          it.rectangle(x, y, 20, 24, fg); it.rectangle(x + 1, y + 1, 18, 22, fg);
+          it.filled_rectangle(x + 9, y, 2, 24, fg);
+          it.filled_rectangle(x, y + 11, 20, 2, fg);
+        }
+      };
+
+      // Tab an der rechten Kante (zeigt auf eine Seitentaste)
+      auto tab = [&](int y, int h) {
+        it.rectangle(W - TAB_W, y, TAB_W, h, INK);
+        it.rectangle(W - TAB_W + 1, y + 1, TAB_W - 1, h - 2, INK);
+      };
+      auto power_tab = [&]() {
+        tab(PWR_Y, PWR_H);
+        ico_power(W - TAB_W / 2, PWR_Y + PWR_H / 2, INK, PAPER);
+      };
+      auto side_tabs_arrows = [&]() {
+        tab(UP_Y, SIDE_H); tab(DN_Y, SIDE_H);
+        ico_up(W - TAB_W / 2, UP_Y + SIDE_H / 2, INK);
+        ico_down(W - TAB_W / 2, DN_Y + SIDE_H / 2, INK);
+      };
+
+      // Statuszeile: Verbindung und Zeitpunkt der letzten Daten
+      auto status_line = [&]() {
+        bool conn = api::global_api_server != nullptr && api::global_api_server->is_connected();
+        it.filled_rectangle(16, STAT_Y - 20, W - 32, 1, INK);
+        if (conn) it.filled_circle(24, STAT_Y, 7, INK);
+        else { it.circle(24, STAT_Y, 7, INK); it.circle(24, STAT_Y, 6, INK); }
+        it.print(38, STAT_Y, id(f_s), INK, TextAlign::CENTER_LEFT, conn ? "Verbunden" : "Keine Verbindung");
+        it.print(W - 16, STAT_Y, id(f_s), INK, TextAlign::CENTER_RIGHT, ("Stand " + id(last_update)).c_str());
+      };
+
+      // ---------- Daten ----------
+      JsonDocument rd, md, pd;
+      const std::string &rs = id(rooms_raw).state;
+      const std::string &ms = id(media_raw).state;
+      const std::string &ps = id(pv_raw).state;
+      if (rs.size() > 1) deserializeJson(rd, rs.c_str() + 1);
+      if (ms.size() > 1) deserializeJson(md, ms.c_str() + 1);
+      if (ps.size() > 1) deserializeJson(pd, ps.c_str() + 1);
+      JsonArray rooms = rd.as<JsonArray>();
+      JsonArray players = md.as<JsonArray>();
+      JsonObject pv = pd.as<JsonObject>();
+      const int nr = rooms.size(), np = players.size();
+      const bool has_pv = !pv.isNull() && (!pv["p"].isNull() || !pv["d"].isNull() || pv["m"].as<JsonArray>().size() > 0);
+      const bool is_sleep = id(sleeping);
+      if ((nr > 0 || np > 0) && id(last_update) == "–") {
+        auto n0 = id(ha_time).now();
+        if (n0.is_valid()) id(last_update) = n0.strftime("%H:%M");
+      }
+
+      // Welche Ebene kommt nach Back?
+      int cur_mode = id(mode);
+      if ((cur_mode == 1 && np == 0) || (cur_mode == 2 && !has_pv)) cur_mode = 0;
+      int next_mode = 0;
+      for (int k = 1; k <= 2; k++) {
+        int m = (cur_mode + k) % 3;
+        if (m == 0 || (m == 1 && np > 0) || (m == 2 && has_pv)) { next_mode = m; break; }
+      }
+
+      // Untere Leiste: 4 Felder über den Fronttasten, OK-Feld invertiert
+      // kind: 0 Raum, 1 Medien, 2 Energie, 3 Übersicht
+      auto bottom_bar = [&](int kind, bool playing) {
+        const int cw = W / 4;
+        it.filled_rectangle(0, BAR_Y, W, 3, INK);
+        for (int i = 1; i < 4; i++) it.filled_rectangle(i * cw - 1, BAR_Y, 2, BAR_H, INK);
+        it.filled_rectangle(cw, BAR_Y, cw, BAR_H, INK);
+        const int iy = BAR_Y + 32, ly = BAR_Y + 70;
+        const char *lab[4] = {"", "", "", ""};
+        // Feld 1 (Back): nächste Ebene
+        if (next_mode == 0)      { ico_home(cw / 2, iy, INK); lab[0] = "Räume"; }
+        else if (next_mode == 1) { ico_note(cw / 2, iy, INK); lab[0] = "Medien"; }
+        else                     { ico_sun(cw / 2, iy, INK);  lab[0] = "Energie"; }
+        // Felder 2–4
+        if (kind == 0) {
+          ico_power(cw + cw / 2, iy, PAPER, INK); lab[1] = "Schalten";
+          ico_left(2 * cw + cw / 2, iy, INK);     lab[2] = "Raum";
+          ico_right(3 * cw + cw / 2, iy, INK);    lab[3] = "Raum";
+        } else if (kind == 3) {
+          ico_right(cw + cw / 2, iy, PAPER);      lab[1] = "Öffnen";
+          ico_left(2 * cw + cw / 2, iy, INK);     lab[2] = "Seite";
+          ico_right(3 * cw + cw / 2, iy, INK);    lab[3] = "Seite";
+        } else if (kind == 1) {
+          if (playing) { ico_pause(cw + cw / 2, iy, PAPER); lab[1] = "Pause"; }
+          else         { ico_play(cw + cw / 2, iy, PAPER);  lab[1] = "Play"; }
+          ico_prev(2 * cw + cw / 2, iy, INK);     lab[2] = "Zurück";
+          ico_next(3 * cw + cw / 2, iy, INK);     lab[3] = "Weiter";
+        } else {
+          ico_refresh(cw + cw / 2, iy, PAPER, INK); lab[1] = "Neu";
+        }
+        for (int i = 0; i < 4; i++)
+          it.print(i * cw + cw / 2, ly, id(f_s), i == 1 ? PAPER : INK, TextAlign::CENTER, lab[i]);
+      };
+
+      if (nr == 0 && np == 0 && !has_pv) {
+        bool conn = api::global_api_server != nullptr && api::global_api_server->is_connected();
+        it.print(W / 2, H / 2, id(f_m), INK, TextAlign::CENTER, conn ? "Keine Daten" : "Verbinde …");
+        return;
+      }
+
+      // =====================================================
+      //  MEDIEN
+      // =====================================================
+      if (!is_sleep && cur_mode == 1) {
+        if (id(player_idx) >= np) id(player_idx) = 0;
+        JsonObject p = players[id(player_idx)];
+        std::string st = p["s"] | "";
+        bool playing = (st == "playing");
+
+        it.print(16, 14, id(f_m), INK, fit(std::string(p["n"] | ""), id(f_m), CW - 110).c_str());
+        it.print(W - 16, 18, id(f_s), INK, TextAlign::TOP_RIGHT, str_sprintf("Player %d/%d", id(player_idx) + 1, np).c_str());
+        it.filled_rectangle(16, 62, W - 32, 2, INK);
+
+        it.filled_circle(36, 116, 22, INK);
+        if (playing) ico_play(37, 116, PAPER); else ico_pause(36, 116, PAPER);
+        const char *stl = playing ? "LÄUFT" : (st == "paused" ? "PAUSIERT" : (st == "off" || st == "standby" ? "AUS" : "BEREIT"));
+        it.print(72, 116, id(f_s), INK, TextAlign::CENTER_LEFT, stl);
+
+        std::string l1, l2;
+        wrap2(std::string(p["ti"] | ""), id(f_l), CW - 16, l1, l2);
+        it.print(16, 168, id(f_l), INK, l1.c_str());
+        if (!l2.empty()) it.print(16, 214, id(f_l), INK, l2.c_str());
+        it.print(16, 278, id(f_m), INK, fit(std::string(p["ar"] | ""), id(f_m), CW - 16).c_str());
+        it.print(16, 320, id(f_s), INK, fit(std::string(p["al"] | ""), id(f_s), CW - 16).c_str());
+
+        int v = (millis() < id(vol_hold_until)) ? id(vol) : (int) (p["v"] | -1);
+        it.print(16, 404, id(f_s), INK, "LAUTSTÄRKE");
+        const int bx = 16, by = 440, bw = CW - 110, bh = 34;
+        it.rectangle(bx, by, bw, bh, INK);
+        it.rectangle(bx + 1, by + 1, bw - 2, bh - 2, INK);
+        if (v > 0) it.filled_rectangle(bx + 4, by + 4, (bw - 8) * v / 100, bh - 8, INK);
+        it.print(CW + 4, by + bh / 2, id(f_l), INK, TextAlign::CENTER_RIGHT, v >= 0 ? str_sprintf("%d", v).c_str() : "–");
+
+        tab(UP_Y, SIDE_H); tab(DN_Y, SIDE_H);
+        it.print(W - TAB_W / 2, UP_Y + SIDE_H / 2, id(f_m), INK, TextAlign::CENTER, "+");
+        it.print(W - TAB_W / 2, DN_Y + SIDE_H / 2, id(f_m), INK, TextAlign::CENTER, "−");
+        status_line();
+        power_tab();
+        bottom_bar(1, playing);
+        return;
+      }
+
+      // =====================================================
+      //  ENERGIE
+      // =====================================================
+      if (!is_sleep && cur_mode == 2) {
+        it.print(16, 14, id(f_m), INK, "Energie");
+        if (!pv["b"].isNull())
+          it.print(W - 16, 18, id(f_s), INK, TextAlign::TOP_RIGHT, str_sprintf("Akku %d %%", pv["b"].as<int>()).c_str());
+        it.filled_rectangle(16, 62, W - 32, 2, INK);
+
+        it.print(16, 80, id(f_s), INK, "LEISTUNG JETZT");
+        std::string pnow = pv["p"].isNull() ? "–" : str_sprintf("%d W", pv["p"].as<int>());
+        it.print(16, 104, id(f_xl), INK, pnow.c_str());
+
+        it.print(16, 204, id(f_s), INK, "HEUTE");
+        std::string ptd = pv["d"].isNull() ? "–" : str_sprintf("%.2f kWh", pv["d"].as<float>());
+        it.print(16, 228, id(f_l), INK, ptd.c_str());
+
+        it.filled_rectangle(16, 290, W - 32, 2, INK);
+        it.print(16, 304, id(f_s), INK, "MODULE");
+        JsonArray mods = pv["m"].as<JsonArray>();
+        const int nm = mods.size();
+        if (nm == 0) {
+          it.print(16, 344, id(f_s), INK, "Label x4_pv_modul vergeben");
+        } else {
+          const int top = 338, avail = STAT_Y - 30 - top;
+          const int rh = std::min(64, avail / nm);
+          int k = 0;
+          for (JsonObject m : mods) {
+            const int y = top + k * rh;
+            if (y + rh > STAT_Y - 30) break;
+            const int pw = m["p"] | 0;
+            it.print(16, y, id(f_s), INK, fit(std::string(m["n"] | ""), id(f_s), CW - 120).c_str());
+            it.print(CW + 4, y, id(f_m), INK, TextAlign::TOP_RIGHT, str_sprintf("%d W", pw).c_str());
+            const int bw = CW - 130, bh = 12, by = y + 30;
+            if (rh >= 46) {
+              it.rectangle(16, by, bw, bh, INK);
+              int fw = (bw - 4) * std::max(0, std::min(pw, PV_PEAK)) / std::max(1, PV_PEAK);
+              if (fw > 0) it.filled_rectangle(18, by + 2, fw, bh - 4, INK);
+            }
+            k++;
+          }
+        }
+        status_line();
+        power_tab();
+        bottom_bar(2, false);
+        return;
+      }
+
+      // =====================================================
+      //  RÄUME: Seite 0 = Übersicht, Seite 1..nr = einzelne Räume
+      // =====================================================
+      if (id(room_idx) > nr) id(room_idx) = 0;
+      const bool overview = (id(room_idx) == 0);
+
+      // Sleep-Hinweis neben der Power-Taste
+      int hy = 0;     // Kopfzeile
+      int y0 = 0;     // Inhalt darunter
+      if (is_sleep) {
+        const int bw = 250, bx = W - TAB_W - bw;
+        it.filled_rectangle(bx, PWR_Y, bw, PWR_H, INK);
+        it.print(W - TAB_W - 46, PWR_Y + 6, id(f_s), PAPER, TextAlign::TOP_RIGHT, "Power drücken");
+        it.print(W - TAB_W - 46, PWR_Y + 33, id(f_s), PAPER, TextAlign::TOP_RIGHT, "zum Aufwecken");
+        it.filled_rectangle(W - TAB_W - 38, PWR_Y + PWR_H / 2 - 3, 12, 6, PAPER);
+        it.filled_triangle(W - TAB_W - 26, PWR_Y + PWR_H / 2 - 12, W - TAB_W - 26, PWR_Y + PWR_H / 2 + 12, W - TAB_W - 10, PWR_Y + PWR_H / 2, PAPER);
+        tab(PWR_Y, PWR_H);
+        ico_power(W - TAB_W / 2, PWR_Y + PWR_H / 2, INK, PAPER);
+        if (PWR_Y < 80) { hy = PWR_Y + PWR_H + 12; y0 = hy; }
+        else y0 = std::max(0, PWR_Y + PWR_H + 12 - 74);
+      }
+
+      if (overview) {
+        // ---------- Übersicht: nur Räume mit Fenstern/Türen ----------
+        std::vector<int> wi;
+        int open_total = 0;
+        for (int k = 0; k < nr; k++) {
+          JsonArray ws = rooms[k]["w"].as<JsonArray>();
+          if (ws.size() > 0) wi.push_back(k);
+          for (JsonObject w : ws) if ((w["o"] | 0) == 1) open_total++;
+        }
+        const int nw = wi.size();
+        it.print(16, hy + 14, id(f_m), INK, "Fenster");
+        std::string right = is_sleep ? "Stand " + id(last_update)
+                          : (open_total == 0 ? std::string("alle zu") : str_sprintf("%d offen", open_total));
+        it.print(W - 16, hy + 18, id(f_s), INK, TextAlign::TOP_RIGHT, right.c_str());
+        it.filled_rectangle(16, hy + 62, W - 32, 2, INK);
+
+        const int RH = 50;
+        const int ly = std::max(hy + 76, y0 + 76);
+        const int limit = is_sleep ? H - 40 : STAT_Y - 26;
+        const int rows = std::max(1, (limit - ly) / RH);
+        if (id(ov_sel) >= nw) id(ov_sel) = 0;
+        int first = is_sleep ? 0 : std::max(0, id(ov_sel) - rows + 1);
+        if (nw == 0) it.print(16, ly + 10, id(f_s), INK, "Keine Fenstersensoren gefunden");
+        for (int k = first; k < nw && k < first + rows; k++) {
+          JsonObject r = rooms[wi[k]];
+          const int y = ly + (k - first) * RH;
+          const bool hl = !is_sleep && k == id(ov_sel);
+          const Color fg = hl ? PAPER : INK;
+          const Color bg = hl ? INK : PAPER;
+          if (hl) it.filled_rectangle(8, y, CW, RH - 6, INK);
+          const int cy = y + (RH - 6) / 2;
+          std::string open_names;
+          int nopen = 0;
+          for (JsonObject w : r["w"].as<JsonArray>()) {
+            if ((w["o"] | 0) == 1) {
+              if (!open_names.empty()) open_names += ", ";
+              open_names += (w["n"] | "");
+              nopen++;
+            }
+          }
+          ico_window(16, cy - 12, nopen > 0, fg, bg);
+          it.print(46, cy, id(f_m), fg, TextAlign::CENTER_LEFT, fit(std::string(r["n"] | ""), id(f_m), 190).c_str());
+          std::string st = nopen == 0 ? std::string("zu") : open_names;
+          it.print(8 + CW - 12, cy, id(f_s), fg, TextAlign::CENTER_RIGHT, fit(st, id(f_s), CW - 250).c_str());
+        }
+        if (!is_sleep && first + rows < nw) ico_down(CW - 40, limit - 4, INK);
+
+        if (is_sleep) {
+          it.print(16, H - 36, id(f_s), INK, "Schläft");
+          return;
+        }
+        side_tabs_arrows();
+        status_line();
+        power_tab();
+        bottom_bar(3, false);
+        return;
+      }
+
+      // ---------- Einzelner Raum ----------
+      JsonObject r = rooms[id(room_idx) - 1];
+      JsonArray items = r["i"].as<JsonArray>();
+      JsonArray wins = r["w"].as<JsonArray>();
+      const int ni = items.size();
+      if (id(sel) >= ni) id(sel) = 0;
+
+      it.print(16, hy + 14, id(f_m), INK, fit(std::string(r["n"] | ""), id(f_m), CW - 150).c_str());
+      std::string right = is_sleep ? "Stand " + id(last_update) : str_sprintf("Raum %d/%d", id(room_idx), nr);
+      it.print(W - 16, hy + 18, id(f_s), INK, TextAlign::TOP_RIGHT, right.c_str());
+      it.filled_rectangle(16, hy + 62, W - 32, 2, INK);
+
+      std::string ts = r["t"].isNull() ? "–" : str_sprintf("%.1f°", r["t"].as<float>());
+      std::string hs = r["h"].isNull() ? "–" : str_sprintf("%d%%", r["h"].as<int>());
+      it.print(16, y0 + 74, id(f_xl), INK, ts.c_str());
+      it.print(250, y0 + 74, id(f_xl), INK, hs.c_str());
+      it.print(18, y0 + 164, id(f_s), INK, "Temperatur");
+      it.print(252, y0 + 164, id(f_s), INK, "Feuchte");
+
+      // Fenster/Türen
+      int ly = y0 + 210;
+      if (wins.size() > 0) {
+        std::string open_names;
+        int nopen = 0;
+        for (JsonObject w : wins) {
+          if ((w["o"] | 0) == 1) {
+            if (!open_names.empty()) open_names += ", ";
+            open_names += (w["n"] | "");
+            nopen++;
+          }
+        }
+        ico_window(16, y0 + 200, nopen > 0, INK, PAPER);
+        std::string wt = nopen == 0 ? std::string("Fenster alle zu") : "Offen: " + open_names;
+        it.print(46, y0 + 212, id(f_s), INK, TextAlign::CENTER_LEFT, fit(wt, id(f_s), CW - 40).c_str());
+        ly = y0 + 244;
+      }
+
+      // Lampen (Kreis) und Steckdosen (Quadrat), gefüllt = an
+      const int RH = 54;
+      const int limit = is_sleep ? H - 110 : STAT_Y - 26;
+      const int rows = std::max(1, (limit - ly) / RH);
+      int first = is_sleep ? 0 : std::max(0, id(sel) - rows + 1);
+      if (ni == 0) it.print(16, ly + 10, id(f_s), INK, "Keine Lampen oder Steckdosen");
+      for (int k = first; k < ni && k < first + rows; k++) {
+        JsonObject e = items[k];
+        const int y = ly + (k - first) * RH;
+        const bool hl = !is_sleep && k == id(sel);
+        const Color fg = hl ? PAPER : INK;
+        if (hl) it.filled_rectangle(8, y, CW, RH - 6, INK);
+        const int cy = y + (RH - 6) / 2;
+        const bool on = (e["s"] | 0) == 1;
+        if (std::string(e["t"] | "l") == "l") {
+          if (on) it.filled_circle(34, cy, 12, fg);
+          else { it.circle(34, cy, 12, fg); it.circle(34, cy, 11, fg); }
+        } else {
+          if (on) it.filled_rectangle(22, cy - 12, 24, 24, fg);
+          else { it.rectangle(22, cy - 12, 24, 24, fg); it.rectangle(23, cy - 11, 22, 22, fg); }
+        }
+        it.print(60, cy, id(f_m), fg, TextAlign::CENTER_LEFT, fit(std::string(e["n"] | ""), id(f_m), CW - 140).c_str());
+        std::string rt = on ? "AN" : "aus";
+        if (on && !e["p"].isNull()) rt = str_sprintf("%d W", e["p"].as<int>());   // Steckdose mit Leistungsmessung
+        it.print(8 + CW - 12, cy, id(f_s), fg, TextAlign::CENTER_RIGHT, rt.c_str());
+      }
+      if (first + rows < ni) ico_down(CW - 40, limit - 4, INK);
+      if (first > 0) ico_up(CW - 40, ly - 10, INK);
+
+      if (is_sleep) {
+        for (JsonObject p : players) {
+          if (std::string(p["s"] | "") == "playing") {
+            std::string np_txt = std::string(p["ar"] | "") + " – " + std::string(p["ti"] | "");
+            it.filled_rectangle(16, H - 108, W - 32, 2, INK);
+            ico_note(30, H - 76, INK);
+            it.print(52, H - 76, id(f_s), INK, TextAlign::CENTER_LEFT, fit(np_txt, id(f_s), W - 70).c_str());
+            break;
+          }
+        }
+        float bv = id(batt_v).state;
+        std::string bt = std::isnan(bv) ? "" : str_sprintf("Akku %d %%", std::max(0, std::min(100, (int) ((bv - 3.3f) / 0.9f * 100))));
+        it.print(16, H - 36, id(f_s), INK, "Schläft");
+        it.print(W - 16, H - 36, id(f_s), INK, TextAlign::TOP_RIGHT, bt.c_str());
+        return;
+      }
+
+      side_tabs_arrows();
+      status_line();
+      power_tab();
+      bottom_bar(0, false);
+
+# ---------------------------------------------------------------------
+#  Daten aus Home Assistant
+# ---------------------------------------------------------------------
+text_sensor:
+  - platform: homeassistant
+    id: rooms_raw
+    entity_id: ${data_sensor}
+    attribute: rooms
+    internal: true
+    on_value:
+      - lambda: |-
+          auto n = id(ha_time).now();
+          if (n.is_valid()) id(last_update) = n.strftime("%H:%M");
+      - if:
+          condition:
+            lambda: 'return !id(sleeping) && id(mode) == 0;'
+          then:
+            - script.execute: redraw
+  - platform: homeassistant
+    id: media_raw
+    entity_id: ${data_sensor}
+    attribute: media
+    internal: true
+    on_value:
+      - lambda: |-
+          auto n = id(ha_time).now();
+          if (n.is_valid()) id(last_update) = n.strftime("%H:%M");
+      - if:
+          condition:
+            lambda: 'return !id(sleeping) && id(mode) == 1;'
+          then:
+            - script.execute: redraw
+  - platform: homeassistant
+    id: pv_raw
+    entity_id: ${data_sensor}
+    attribute: pv
+    internal: true
+    on_value:
+      - lambda: |-
+          auto n = id(ha_time).now();
+          if (n.is_valid()) id(last_update) = n.strftime("%H:%M");
+      - if:
+          condition:
+            lambda: 'return !id(sleeping) && id(mode) == 2;'
+          then:
+            - script.execute: redraw
+
+# ---------------------------------------------------------------------
+#  Tasten, Akku
+# ---------------------------------------------------------------------
+sensor:
+  # Front: Back ~3470, OK ~2655, Links ~1470, Rechts ~0 (Rohwerte)
+  - platform: adc
+    id: btn_adc1
+    pin: GPIO1
+    attenuation: 12db
+    raw: true
+    update_interval: 40ms
+    internal: true
+    filters:
+      - median:
+          window_size: 3
+          send_every: 1
+      - delta: 150
+    on_value:
+      - lambda: |-
+          int b = 0;
+          if (x < 500) b = 4;          // Rechts
+          else if (x < 2000) b = 3;    // Links
+          else if (x < 3050) b = 2;    // OK
+          else if (x < 3850) b = 1;    // Back
+          ESP_LOGI("x4btn", "FRONT raw=%.0f -> button %d", x, b);
+          id(ladder_change)->execute(1, b);
+  # Seite: Hoch/+ ~2205, Runter/− ~0 (Rohwerte)
+  - platform: adc
+    id: btn_adc2
+    pin: GPIO2
+    attenuation: 12db
+    raw: true
+    update_interval: 40ms
+    internal: true
+    filters:
+      - median:
+          window_size: 3
+          send_every: 1
+      - delta: 150
+    on_value:
+      - lambda: |-
+          int b = 0;
+          if (x < 500) b = 6;                       // Runter / leiser
+          else if (x > 1700 && x < 2700) b = 5;     // Hoch / lauter
+          ESP_LOGI("x4btn", "SIDE raw=%.0f -> button %d", x, b);
+          id(ladder_change)->execute(2, b);
+  - platform: adc
+    id: batt_v
+    name: "Akku Spannung"
+    pin: GPIO0
+    attenuation: 12db
+    update_interval: 60s
+    filters:
+      - multiply: 2.0
+
+binary_sensor:
+  - platform: gpio
+    id: power_btn
+    internal: true
+    pin:
+      number: GPIO3
+      inverted: true
+      mode: input_pullup
+      allow_other_uses: true
+    on_click:
+      - min_length: 30ms
+        max_length: 800ms
+        then:
+          - script.execute: idle_timer
+          - component.update: epd
+      - min_length: 1s
+        max_length: 8s
+        then:
+          - script.execute: go_sleep
+
+switch:
+  - platform: template
+    id: stay_awake
+    name: "Wach bleiben (für Updates)"
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+
+deep_sleep:
+  id: deep_sleep_ctl
+  wakeup_pin:
+    number: GPIO3
+    inverted: true
+    allow_other_uses: true
+
+interval:
+  - interval: 15s
+    then:
+      - if:
+          condition:
+            lambda: 'return id(dirty) && !id(sleeping);'
+          then:
+            - lambda: 'id(dirty) = false;'
+            - component.update: epd
+
+# ---------------------------------------------------------------------
+#  Zustand
+# ---------------------------------------------------------------------
+globals:
+  - id: mode            # 0 = Räume, 1 = Medien, 2 = Energie
+    type: int
+    initial_value: '0'
+  - id: room_idx        # 0 = Übersicht, 1..n = Raum
+    type: int
+    restore_value: true
+    initial_value: '0'
+  - id: ov_sel
+    type: int
+    initial_value: '0'
+  - id: sel
+    type: int
+    initial_value: '0'
+  - id: player_idx
+    type: int
+    restore_value: true
+    initial_value: '0'
+  - id: vol
+    type: int
+    initial_value: '-1'
+  - id: vol_hold_until
+    type: uint32_t
+    initial_value: '0'
+  - id: vol_entity
+    type: std::string
+    initial_value: '""'
+  - id: dirty
+    type: bool
+    initial_value: 'false'
+  - id: fast_until
+    type: uint32_t
+    initial_value: '20000'
+  - id: last_update
+    type: std::string
+    initial_value: '"–"'
+  - id: sleeping
+    type: bool
+    initial_value: 'false'
+  - id: btn_down
+    type: int
+    initial_value: '0'
+  - id: btn_t0
+    type: uint32_t
+    initial_value: '0'
+  - id: act
+    type: std::string
+    initial_value: '""'
+  - id: act_entity
+    type: std::string
+    initial_value: '""'
+
+# ---------------------------------------------------------------------
+#  Logik
+# ---------------------------------------------------------------------
+script:
+  # Erkennt Drücken/Loslassen auf den Widerstandsleitern
+  - id: ladder_change
+    mode: queued
+    max_runs: 10
+    parameters:
+      src: int
+      b: int
+    then:
+      - lambda: |-
+          if (b != 0 && id(btn_down) == 0) {
+            id(btn_down) = b;
+            id(btn_t0) = millis();
+          } else if (b == 0 && id(btn_down) != 0 && ((src == 1) == (id(btn_down) <= 4))) {
+            int pressed = id(btn_down);
+            bool lng = (millis() - id(btn_t0)) > 700;
+            id(btn_down) = 0;
+            id(handle_button)->execute(pressed, lng);
+          }
+
+  # 1 Back, 2 OK, 3 Links, 4 Rechts, 5 Seite hoch/+, 6 Seite runter/−
+  - id: handle_button
+    mode: queued
+    max_runs: 5
+    parameters:
+      b: int
+      lng: bool
+    then:
+      - script.execute: idle_timer
+      - lambda: |-
+          id(fast_until) = millis() + 4000;
+          id(act) = "";
+          id(act_entity) = "";
+          JsonDocument rd, md, pd;
+          const std::string &rs = id(rooms_raw).state;
+          const std::string &ms = id(media_raw).state;
+          const std::string &ps = id(pv_raw).state;
+          if (rs.size() > 1) deserializeJson(rd, rs.c_str() + 1);
+          if (ms.size() > 1) deserializeJson(md, ms.c_str() + 1);
+          if (ps.size() > 1) deserializeJson(pd, ps.c_str() + 1);
+          JsonArray rooms = rd.as<JsonArray>();
+          JsonArray players = md.as<JsonArray>();
+          JsonObject pv = pd.as<JsonObject>();
+          const int nr = rooms.size(), np = players.size();
+          const bool has_pv = !pv.isNull() && (!pv["p"].isNull() || !pv["d"].isNull() || pv["m"].as<JsonArray>().size() > 0);
+
+          int cur_mode = id(mode);
+          if ((cur_mode == 1 && np == 0) || (cur_mode == 2 && !has_pv)) cur_mode = 0;
+
+          if (b == 1) {                      // Back: nächste Ebene
+            int next_mode = 0;
+            for (int k = 1; k <= 2; k++) {
+              int m = (cur_mode + k) % 3;
+              if (m == 0 || (m == 1 && np > 0) || (m == 2 && has_pv)) { next_mode = m; break; }
+            }
+            id(mode) = next_mode;
+            return;
+          }
+          id(mode) = cur_mode;
+
+          if (cur_mode == 0) {                   // ---- Räume ----
+            const int pages = nr + 1;        // Seite 0 = Übersicht
+            if (id(room_idx) >= pages) id(room_idx) = 0;
+            if (b == 3) { id(room_idx) = (id(room_idx) + pages - 1) % pages; id(sel) = 0; return; }
+            if (b == 4) { id(room_idx) = (id(room_idx) + 1) % pages; id(sel) = 0; return; }
+            if (id(room_idx) == 0) {         // Übersicht (nur Räume mit Fenstern)
+              std::vector<int> wi;
+              for (int k = 0; k < nr; k++) if (rooms[k]["w"].as<JsonArray>().size() > 0) wi.push_back(k);
+              const int nw = wi.size();
+              if (nw == 0) return;
+              if (id(ov_sel) >= nw) id(ov_sel) = 0;
+              if (b == 5) id(ov_sel) = (id(ov_sel) + nw - 1) % nw;
+              else if (b == 6) id(ov_sel) = (id(ov_sel) + 1) % nw;
+              else if (b == 2) { id(room_idx) = wi[id(ov_sel)] + 1; id(sel) = 0; }
+              return;
+            }
+            JsonArray items = rooms[id(room_idx) - 1]["i"].as<JsonArray>();
+            const int ni = items.size();
+            if (b == 5 && ni > 0) { id(sel) = (id(sel) + ni - 1) % ni; }
+            else if (b == 6 && ni > 0) { id(sel) = (id(sel) + 1) % ni; }
+            else if (b == 2 && ni > 0) {
+              if (lng) {
+                std::string all;
+                for (JsonObject e : items) { if (!all.empty()) all += ","; all += (e["e"] | ""); }
+                id(act) = "off";
+                id(act_entity) = all;
+              } else {
+                if (id(sel) >= ni) id(sel) = 0;
+                id(act) = "toggle";
+                id(act_entity) = items[id(sel)]["e"] | "";
+              }
+            }
+          } else if (cur_mode == 1) {        // ---- Medien ----
+            if (id(player_idx) >= np) id(player_idx) = 0;
+            if (lng && (b == 3 || b == 4)) {
+              id(player_idx) = (id(player_idx) + (b == 4 ? 1 : np - 1)) % np;
+              id(vol_hold_until) = 0;
+              return;
+            }
+            JsonObject p = players[id(player_idx)];
+            id(act_entity) = p["e"] | "";
+            if (b == 2) id(act) = "play_pause";
+            else if (b == 3) id(act) = "prev";
+            else if (b == 4) id(act) = "next";
+            else if (b == 5 || b == 6) {
+              int v = (millis() < id(vol_hold_until)) ? id(vol) : (int) (p["v"] | 0);
+              if (v < 0) v = 0;
+              v += (b == 5) ? 5 : -5;
+              id(vol) = std::max(0, std::min(100, v));
+              id(vol_hold_until) = millis() + 3000;
+              id(vol_entity) = id(act_entity);
+              id(act) = "vol";
+            }
+          }
+          // mode == 2 (Energie): nur neu zeichnen
+      - if:
+          condition:
+            lambda: 'return id(act) == "toggle";'
+          then:
+            - homeassistant.action:
+                action: homeassistant.toggle
+                data:
+                  entity_id: !lambda 'return id(act_entity);'
+      - if:
+          condition:
+            lambda: 'return id(act) == "off";'
+          then:
+            - homeassistant.action:
+                action: homeassistant.turn_off
+                data:
+                  entity_id: !lambda 'return id(act_entity);'
+      - if:
+          condition:
+            lambda: 'return id(act) == "play_pause";'
+          then:
+            - homeassistant.action:
+                action: media_player.media_play_pause
+                data:
+                  entity_id: !lambda 'return id(act_entity);'
+      - if:
+          condition:
+            lambda: 'return id(act) == "next";'
+          then:
+            - homeassistant.action:
+                action: media_player.media_next_track
+                data:
+                  entity_id: !lambda 'return id(act_entity);'
+      - if:
+          condition:
+            lambda: 'return id(act) == "prev";'
+          then:
+            - homeassistant.action:
+                action: media_player.media_previous_track
+                data:
+                  entity_id: !lambda 'return id(act_entity);'
+      - if:
+          condition:
+            lambda: 'return id(act) == "vol";'
+          then:
+            - script.execute: send_volume
+      - component.update: epd
+
+  # Neue Daten: direkt nach einem Tastendruck sofort zeichnen,
+  # sonst höchstens alle 15 s (spart Akku und Flackern, z. B. bei Watt-Werten)
+  - id: redraw
+    mode: queued
+    max_runs: 3
+    then:
+      - if:
+          condition:
+            lambda: 'return millis() < id(fast_until);'
+          then:
+            - component.update: epd
+          else:
+            - lambda: 'id(dirty) = true;'
+
+  # Lautstärke erst 400 ms nach dem letzten Druck senden
+  - id: send_volume
+    mode: restart
+    then:
+      - delay: 400ms
+      - homeassistant.action:
+          action: media_player.volume_set
+          data:
+            entity_id: !lambda 'return id(vol_entity);'
+            volume_level: !lambda 'return str_sprintf("%.2f", id(vol) / 100.0f);'
+
+  # 5 Minuten nach dem letzten Tastendruck schlafen
+  - id: idle_timer
+    mode: restart
+    then:
+      - delay: ${idle_timeout}
+      - wait_until:
+          condition:
+            switch.is_off: stay_awake
+      - script.execute: go_sleep
+
+  - id: go_sleep
+    mode: single
+    then:
+      - lambda: 'id(sleeping) = true; id(mode) = 0;'
+      - component.update: epd
+      - delay: 4s
+      - lambda: |-
+          // Ohne diesen Hold schaltet sich der X4 im Deep Sleep ganz ab
+          // und wacht nicht mehr auf.
+          gpio_hold_en(GPIO_NUM_13);
+          gpio_deep_sleep_hold_en();
+      - deep_sleep.enter: deep_sleep_ctl

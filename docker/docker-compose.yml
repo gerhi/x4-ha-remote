@@ -1,0 +1,16 @@
+# ESPHome Device Builder (Weboberfläche auf Port 6052)
+# Ablage: /opt/esphome/docker-compose.yml
+# Konfigurationsdateien liegen in /opt/esphome/config
+
+services:
+  esphome:
+    image: ghcr.io/esphome/esphome:stable
+    container_name: esphome
+    restart: "no"              # startet nur, wenn du es willst
+    network_mode: host         # nötig, damit Geräte im WLAN gefunden werden
+    privileged: true           # Zugriff auf USB, auch wenn der X4 erst später eingesteckt wird
+    environment:
+      - TZ=Europe/Berlin
+    volumes:
+      - ./config:/config
+      - /dev:/dev
